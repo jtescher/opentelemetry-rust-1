@@ -56,9 +56,33 @@
 //! ```no_run
 //! use opentelemetry::api::{KeyValue, trace::Tracer};
 //! use opentelemetry::sdk::{trace::{self, IdGenerator, Sampler}, Resource};
+//! use opentelemetry::exporter::trace::ExportResult;
+//! use opentelemetry_zipkin::HttpClient;
+//! use async_trait::async_trait;
+//! use std::error::Error;
 //!
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // `reqwest` and `surf` are supported through features, if you prefer an
+//! // alternate http client you can add support by implementing `HttpClient` as
+//! // shown here.
+//! #[derive(Debug)]
+//! struct IsahcClient(isahc::HttpClient);
+//!
+//! #[async_trait]
+//! impl HttpClient for IsahcClient {
+//!   async fn send(&self, request: http::Request<String>) -> Result<ExportResult, Box<dyn Error>> {
+//!     let result = self.0.send_async(request).await?;
+//!
+//!     if result.status().is_success() {
+//!       Ok(ExportResult::Success)
+//!     } else {
+//!       Ok(ExportResult::FailedNotRetryable)
+//!     }
+//!   }
+//! }
+//!
+//! fn main() -> Result<(), Box<dyn Error>> {
 //!     let (tracer, _uninstall) = opentelemetry_zipkin::new_pipeline()
+//!         .with_http_client(IsahcClient(isahc::HttpClient::new()?))
 //!         .with_service_name("my_app")
 //!         .with_service_address("127.0.0.1:8080".parse()?)
 //!         .with_collector_endpoint("http://localhost:9411/api/v2/spans")
@@ -90,13 +114,14 @@ mod model;
 mod uploader;
 
 use async_trait::async_trait;
-use http_client::http_types::url;
+use http::Uri;
 use model::endpoint::Endpoint;
 use opentelemetry::{api::trace::TracerProvider, exporter::trace, global, sdk};
 use std::error::Error;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use http_client::h1::H1Client;
+pub use uploader::HttpClient;
 
 /// Default Zipkin collector endpoint
 const DEFAULT_COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:9411/api/v2/spans";
@@ -114,8 +139,8 @@ pub struct Exporter {
 impl Exporter {
     fn new(
         local_endpoint: Endpoint,
-        client: Box<dyn http_client::HttpClient + Send + Sync>,
-        collector_endpoint: url::Url,
+        client: Box<dyn uploader::HttpClient>,
+        collector_endpoint: Uri,
     ) -> Self {
         Exporter {
             local_endpoint,
@@ -136,7 +161,7 @@ pub struct ZipkinPipelineBuilder {
     service_addr: Option<SocketAddr>,
     collector_endpoint: String,
     trace_config: Option<sdk::trace::Config>,
-    client: Box<dyn http_client::HttpClient + Send + Sync>,
+    client: Option<Box<dyn uploader::HttpClient>>,
 }
 
 impl Default for ZipkinPipelineBuilder {
@@ -146,7 +171,12 @@ impl Default for ZipkinPipelineBuilder {
             service_addr: None,
             collector_endpoint: DEFAULT_COLLECTOR_ENDPOINT.to_string(),
             trace_config: None,
-            client: Box::new(H1Client::new()),
+            #[cfg(feature = "reqwest")]
+            client: Some(Box::new(reqwest::Client::new())),
+            #[cfg(all(not(feature = "reqwest"), feature = "surf"))]
+            client: Some(Box::new(surf::Client::new())),
+            #[cfg(all(not(feature = "reqwest"), not(feature = "surf")))]
+            client: None,
         }
     }
 }
@@ -154,8 +184,18 @@ impl Default for ZipkinPipelineBuilder {
 impl ZipkinPipelineBuilder {
     /// Create `ExporterConfig` struct from current `ExporterConfigBuilder`
     pub fn install(mut self) -> Result<(sdk::trace::Tracer, Uninstall), Box<dyn Error>> {
+        if self.client.is_none() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::Other,
+                "Http client must be set, use `reqwest` or `surf` features or impl your own.",
+            )));
+        }
         let endpoint = Endpoint::new(self.service_name, self.service_addr);
-        let exporter = Exporter::new(endpoint, self.client, self.collector_endpoint.parse()?);
+        let exporter = Exporter::new(
+            endpoint,
+            self.client.unwrap(),
+            self.collector_endpoint.parse()?,
+        );
 
         let mut provider_builder = sdk::trace::TracerProvider::builder().with_exporter(exporter);
         if let Some(config) = self.trace_config.take() {
@@ -174,9 +214,9 @@ impl ZipkinPipelineBuilder {
         self
     }
 
-    /// Assign client implementation
-    pub fn with_client<T: http_client::HttpClient + Send + Sync>(mut self, client: T) -> Self {
-        self.client = Box::new(client);
+    /// Assign http client implementation
+    pub fn with_http_client<T: uploader::HttpClient + 'static>(mut self, client: T) -> Self {
+        self.client = Some(Box::new(client));
         self
     }
 
